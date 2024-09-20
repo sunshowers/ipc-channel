@@ -49,9 +49,9 @@ const MAX_FDS_IN_CMSG: u32 = 64;
 // Empirically, we have to deduct 32 bytes from that.
 const RESERVED_SIZE: usize = 32;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "illumos"))]
 const SOCK_FLAGS: c_int = libc::SOCK_CLOEXEC;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "illumos")))]
 const SOCK_FLAGS: c_int = 0;
 
 #[cfg(target_os = "linux")]
@@ -130,9 +130,15 @@ pub struct OsIpcReceiver {
 impl Drop for OsIpcReceiver {
     fn drop(&mut self) {
         unsafe {
-            if self.fd.get() >= 0 {
-                let result = libc::close(self.fd.get());
-                assert!(thread::panicking() || result == 0);
+            let fd = self.fd.get();
+            if fd >= 0 {
+                let result = libc::close(fd);
+                assert!(
+                    thread::panicking() || result == 0,
+                    "closed receiver (fd: {}): {}",
+                    fd,
+                    UnixError::last(),
+                );
             }
         }
     }
@@ -716,7 +722,16 @@ fn make_socket_lingering(sockfd: c_int) -> Result<(), UnixError> {
         )
     };
     if err < 0 {
-        return Err(UnixError::last());
+        // On some platforms like illumos, if the other side of the connection has already been
+        // closed, we can get EINVAL here. Ignore that error.
+        let error = UnixError::last();
+        #[cfg(target_os = "illumos")]
+        {
+            if let UnixError::Errno(libc::EINVAL) = error {
+                return Ok(());
+            }
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -752,7 +767,9 @@ impl BackingStore {
     pub unsafe fn map_file(&self, length: Option<size_t>) -> (*mut u8, size_t) {
         let length = length.unwrap_or_else(|| {
             let mut st = mem::MaybeUninit::uninit();
-            assert!(libc::fstat(self.fd, st.as_mut_ptr()) == 0);
+            if libc::fstat(self.fd, st.as_mut_ptr()) != 0 {
+                panic!("error stating fd {}: {}", self.fd, UnixError::last());
+            }
             st.assume_init().st_size as size_t
         });
         if length == 0 {
